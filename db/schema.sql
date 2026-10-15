@@ -37,6 +37,14 @@ CREATE TABLE payments (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE idempotency_keys (
+    key         TEXT PRIMARY KEY,
+    scope       TEXT NOT NULL,
+    status_code INT,
+    response    JSONB,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Seed 500 seats: S001 ... S500
 INSERT INTO seats (seat_number)
 SELECT 'S' || lpad(n::text, 3, '0')

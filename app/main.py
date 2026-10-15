@@ -5,7 +5,10 @@ import time
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel
 
 from app.db import pool
@@ -79,9 +82,7 @@ def list_seats(available_only: bool = False):
         rows = conn.execute(query, (available_only,)).fetchall()
     return {"count": len(rows), "seats": rows}
 
-
-@app.post("/seats/{seat_id}/reserve", status_code=201)
-def reserve_seat(seat_id: int, body: ReserveIn):
+def do_reserve(seat_id: int, body: ReserveIn):
     with pool.connection() as conn:  # one transaction: commits at the end
         # 0. does the user exist?
         user = conn.execute(
@@ -134,6 +135,17 @@ def reserve_seat(seat_id: int, body: ReserveIn):
 
     return {"booking": booking, "seat_number": won["seat_number"]}
 
+
+@app.post("/seats/{seat_id}/reserve", status_code=201)
+def reserve_seat(
+    seat_id: int,
+    body: ReserveIn,
+    idempotency_key: str | None = Header(default=None),
+):
+    scope = f"reserve:{seat_id}:{body.user_id}"
+    return run_idempotent(idempotency_key, scope, lambda: do_reserve(seat_id, body), 201)
+
+
 # ---------- helpers ----------
 def release_seat(conn, seat_id: int, user_id: int):
     """Give the seat back, but only if this user still holds it."""
@@ -158,6 +170,55 @@ def simulate_payment(forced: str | None) -> str:
         time.sleep(random.uniform(0, PAYMENT_MAX_DELAY))
     return outcome
 
+def run_idempotent(key, scope, work, success_code):
+    """Run work() at most once per Idempotency-Key; replay the saved answer after."""
+    if key is None:  # client didn't send a key: just do the work
+        return JSONResponse(jsonable_encoder(work()), status_code=success_code)
+
+    # 1. claim the key (committed immediately, in its own transaction)
+    with pool.connection() as conn:
+        claimed = conn.execute(
+            """
+            INSERT INTO idempotency_keys (key, scope) VALUES (%s, %s)
+            ON CONFLICT (key) DO NOTHING RETURNING key
+            """,
+            (key, scope),
+        ).fetchone()
+
+    # 2. key already seen: replay the saved answer
+    if claimed is None:
+        with pool.connection() as conn:
+            row = conn.execute(
+                "SELECT scope, status_code, response FROM idempotency_keys WHERE key = %s",
+                (key,),
+            ).fetchone()
+        if row["scope"] != scope:
+            raise HTTPException(422, "Idempotency-Key was already used for a different request")
+        if row["status_code"] is None:
+            raise HTTPException(409, "A request with this key is still in progress")
+        return JSONResponse(
+            row["response"],
+            status_code=row["status_code"],
+            headers={"Idempotent-Replay": "true"},
+        )
+
+    # 3. first time: do the work and save the result
+    try:
+        code, body = success_code, jsonable_encoder(work())
+    except HTTPException as e:  # normal failures (409, 404...) are saved too
+        code, body = e.status_code, {"detail": e.detail}
+    except Exception:           # unexpected crash: free the key so the client can retry
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM idempotency_keys WHERE key = %s", (key,))
+        raise
+
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE idempotency_keys SET status_code = %s, response = %s WHERE key = %s",
+            (code, Jsonb(body), key),
+        )
+    return JSONResponse(body, status_code=code)
+
 
 # ---------- booking endpoints ----------
 @app.get("/bookings/{booking_id}")
@@ -178,8 +239,35 @@ def get_booking(booking_id: int):
     return row
 
 
-@app.post("/bookings/{booking_id}/pay")
-def pay_booking(booking_id: int, body: PayIn = PayIn()):
+@app.get("/users/{user_id}/bookings")
+def user_bookings(user_id: int, status: str | None = None):
+    with pool.connection() as conn:
+        user = conn.execute(
+            "SELECT id, name, email FROM users WHERE id = %s", (user_id,)
+        ).fetchone()
+        if user is None:
+            raise HTTPException(404, "User not found")
+
+        rows = conn.execute(
+            """
+            SELECT * FROM (
+                SELECT b.id AS booking_id, b.seat_id, s.seat_number,
+                       CASE WHEN b.status = 'PENDING' AND b.expires_at < now()
+                            THEN 'EXPIRED' ELSE b.status END AS status,
+                       b.created_at, b.expires_at
+                FROM bookings b
+                JOIN seats s ON s.id = b.seat_id
+                WHERE b.user_id = %s
+            ) AS h
+            WHERE (%s::text IS NULL OR h.status = %s::text)
+            ORDER BY h.created_at DESC
+            """,
+            (user_id, status, status),
+        ).fetchall()
+    return {"user": user, "count": len(rows), "bookings": rows}
+
+
+def do_pay(booking_id: int, body: PayIn):
     # ---- phase 1: validate and record a PENDING payment ----
     with pool.connection() as conn:
         booking = conn.execute(
@@ -263,6 +351,16 @@ def pay_booking(booking_id: int, body: PayIn = PayIn()):
         return {"payment_id": payment_id, "outcome": outcome,
                 "booking_status": booking["status"],
                 "message": "Reservation was lost while paying. No charge made."}
+
+
+@app.post("/bookings/{booking_id}/pay")
+def pay_booking(
+    booking_id: int,
+    body: PayIn = PayIn(),
+    idempotency_key: str | None = Header(default=None),
+):
+    scope = f"pay:{booking_id}"
+    return run_idempotent(idempotency_key, scope, lambda: do_pay(booking_id, body), 200)
 
 
 @app.post("/bookings/{booking_id}/cancel")
